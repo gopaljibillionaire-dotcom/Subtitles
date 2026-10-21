@@ -1,23 +1,23 @@
-"""Kiyotaka Sales Tracker V4
+"""Kiyotaka Sales Tracker V4 — production-hardened polling bot.
 
 Tracks new document posts in configured Sold and Unsold Telegram channels,
-shows reports/statistics, and posts a temporary System Test report to the
-configured broadcast channel. Only the System Test report is auto-deleted
-(300 seconds after posting); daily reports are not scheduled for deletion.
-
-Install:
-    pip install -r requirements.txt
-
-Before running, set BOT_TOKEN and OWNER_ID below (or use environment variables).
+shows personal reports/statistics, and posts a temporary System Test report.
+The daily report is not auto-deleted. Configure BOT_TOKEN and OWNER_ID through
+your hosting provider's environment variables before starting the app.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Iterator
+from urllib.parse import urlsplit
 
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
@@ -30,24 +30,26 @@ from telegram.ext import (
     filters,
 )
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION — set these two values before starting the bot.
-# You can also use environment variables BOT_TOKEN and OWNER_ID.
-# ---------------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8988298879:AAEpjEIW4zMIKFikhGBrVk-AJoTzHvT4lBQ").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "7123919486"))  # Replace with your Telegram user ID.
+from Config import (
+    BOT_DESCRIPTION,
+    BOT_NAME,
+    BOT_TOKEN as CONFIG_BOT_TOKEN,
+    CHANNEL_ID_RE,
+    DAILY_JOB_NAME,
+    DB_FILE,
+    HEADER,
+    OWNER_ID as CONFIG_OWNER_ID,
+    SUPPORT_USERNAME,
+    TAGLINE,
+    TEST_REPORT_DELETE_SECONDS,
+    TIMEZONE,
+)
 
-BOT_NAME = "Kiyotaka Sales Tracker V4"
-SUPPORT_USERNAME = "@AlwaysKiyotaka"
-DB_FILE = "kiyotaka_sales_v4.db"
-TEST_REPORT_DELETE_SECONDS = 300  # 5 minutes; applies ONLY to System Test reports.
-DAILY_JOB_NAME = "kiyotaka_daily_sales_report"
-CHANNEL_ID_RE = re.compile(r"-100\d+\Z")
-
+BOT_TOKEN = os.getenv("BOT_TOKEN", CONFIG_BOT_TOKEN).strip()
 try:
-    TIMEZONE = ZoneInfo("Asia/Kolkata")
-except ZoneInfoNotFoundError:  # Helps Android/Pydroid builds without system tz data.
-    TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+    OWNER_ID = int(os.getenv("OWNER_ID", str(CONFIG_OWNER_ID)).strip() or "0")
+except ValueError as exc:
+    raise RuntimeError("OWNER_ID must be your numeric Telegram user ID.") from exc
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -55,29 +57,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger("kiyotaka_sales_tracker")
 
-HEADER = (
-    "╔══════════════════════════════╗\n"
-    "║       ✦  ᴋɪʏᴏᴛᴀᴋᴀ  ✦       ║\n"
-    "║      ꜱᴀʟᴇꜱ ᴛʀᴀᴄᴋᴇʀ ᴠ4      ║\n"
-    "╚══════════════════════════════╝"
-)
-TAGLINE = "ᴛʀᴀᴄᴋ ꜰɪʟᴇꜱ. ᴍᴏɴɪᴛᴏʀ ꜱᴀʟᴇꜱ.\nᴀᴜᴛᴏᴍᴀᴛᴇ ʏᴏᴜʀ ʀᴇᴘᴏʀᴛꜱ."
-BOT_DESCRIPTION = (
-    "✦ ᴋɪʏᴏᴛᴀᴋᴀ ꜱᴀʟᴇꜱ ᴛʀᴀᴄᴋᴇʀ ᴠ4 ✦\n"
-    "📊 Track Sold & Unsold file posts.\n"
-    "🗓 Get daily reports and file statistics.\n"
-    "⚙️ Per-user channels, settings, and statistics.\n"
-    "📞 Support: @AlwaysKiyotaka"
-)
+# HTTPX logs requests with their full URL at INFO level. Telegram Bot API URLs
+# contain the bot token, so keep those loggers quiet and redact tokens defensively.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+class SecretRedactionFilter(logging.Filter):
+    """Redact Bot API tokens if any library accidentally includes them in logs."""
+
+    _token_pattern = re.compile(r"(/bot)\d{5,}:[A-Za-z0-9_-]+", re.IGNORECASE)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+            cleaned = self._token_pattern.sub(r"\1[REDACTED]", rendered)
+            if cleaned != rendered:
+                record.msg = cleaned
+                record.args = ()
+        except Exception:
+            # Logging must never crash the bot.
+            pass
+        return True
+
+
+_secret_filter = SecretRedactionFilter()
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_secret_filter)
 
 # ---------------------------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------------------------
-def db_connect() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_FILE, timeout=20)
+@contextmanager
+def db_connect() -> Iterator[sqlite3.Connection]:
+    """Open a short-lived SQLite connection and always close it afterwards."""
+    if DB_FILE != ":memory:":
+        parent = os.path.dirname(os.path.abspath(DB_FILE))
+        os.makedirs(parent, exist_ok=True)
+
+    connection = sqlite3.connect(DB_FILE, timeout=30)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 20000")
-    return connection
+    connection.execute("PRAGMA busy_timeout = 30000")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def init_database() -> None:
@@ -143,6 +171,39 @@ def init_database() -> None:
             "posted_at TEXT NOT NULL,"
             "UNIQUE(user_id, chat_id, message_id))"
         )
+        # Upgrade user_file_events too, so databases from an intermediate release
+        # don't fail when tracking the next document.
+        user_event_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(user_file_events)").fetchall()
+        }
+        if "file_name" not in user_event_columns:
+            conn.execute(
+                "ALTER TABLE user_file_events ADD COLUMN file_name TEXT NOT NULL DEFAULT ''"
+            )
+            user_event_columns.add("file_name")
+        if "posted_at" not in user_event_columns:
+            conn.execute(
+                "ALTER TABLE user_file_events ADD COLUMN posted_at TEXT NOT NULL DEFAULT ''"
+            )
+            user_event_columns.add("posted_at")
+        user_timestamp_source = next(
+            (name for name in ("created_at", "timestamp", "date", "event_time")
+             if name in user_event_columns),
+            None,
+        )
+        if user_timestamp_source:
+            conn.execute(
+                f"UPDATE user_file_events SET posted_at = CAST({user_timestamp_source} AS TEXT) "
+                "WHERE posted_at = '' AND " + user_timestamp_source + " IS NOT NULL"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_file_events_user_posted "
+            "ON user_file_events(user_id, posted_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_events_posted "
+            "ON file_events(posted_at)"
+        )
         # Preserve old defaults in the legacy table, but never expose them to other users.
         defaults = {
             "sold_channel": "",
@@ -186,7 +247,6 @@ def init_database() -> None:
 
 
 def get_setting(key: str, default: str = "", user_id: int | None = None) -> str:
-    table = "user_settings" if user_id is not None else "settings"
     with db_connect() as conn:
         if user_id is None:
             row = conn.execute(
@@ -766,20 +826,34 @@ async def run_system_test(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         db_status = f"❌ ERROR: {type(exc).__name__}"
 
     report_day = datetime.now(TIMEZONE).date()
-    counts = get_counts_for_day(report_day, user_id=user_id)
+    if db_status == "✅ CONNECTED":
+        try:
+            counts = get_counts_for_day(report_day, user_id=user_id)
+        except sqlite3.Error as exc:
+            logger.exception("Could not read counts during system test")
+            db_status = f"❌ READ ERROR: {type(exc).__name__}"
+            counts = {"sold": 0, "unsold": 0}
+    else:
+        counts = {"sold": 0, "unsold": 0}
+
     total = counts["sold"] + counts["unsold"]
     date_text = f"{report_day.day} {report_day.strftime('%B %Y')}"
     test_report = (
-        "🧪 TEST REPORT\n"
+        "🧪 ꜱʏꜱᴛᴇᴍ ᴛᴇꜱᴛ\n"
         "📊 ᴀᴄᴄᴏᴜɴᴛ ꜱᴀʟᴇꜱ ʀᴇᴘᴏʀᴛ\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📅 ᴅᴀᴛᴇ : {date_text}\n\n"
-        f"📦 ᴛᴏᴛᴀʟ ᴀᴄᴄᴏᴜɴᴛꜱ : {total}\n\n"
-        f"✅ ꜱᴏʟᴅ ᴀᴄᴄᴏᴜɴᴛꜱ : {counts['sold']}\n"
-        f"❌ ᴜɴꜱᴏʟᴅ ᴀᴄᴄᴏᴜɴᴛꜱ : {counts['unsold']}\n\n"
+        f"📅 ᴅᴀᴛᴇ: {date_text}\n"
+        f"📦 ᴛᴏᴛᴀʟ ᴀᴄᴄᴏᴜɴᴛꜱ: {total}\n"
+        f"✅ ꜱᴏʟᴅ: {counts['sold']}\n"
+        f"❌ ᴜɴꜱᴏʟᴅ: {counts['unsold']}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ ꜱᴛᴀᴛᴜꜱ : ᴄᴏᴍᴘʟᴇᴛᴇ ✓\n\n"
-        "⏱️ ᴛʜɪꜱ ᴛᴇꜱᴛ ʀᴇᴘᴏʀᴛ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ 5 ᴍɪɴᴜᴛᴇꜱ."
+        f"📢 ꜱᴏʟᴅ ᴄʜᴀɴɴᴇʟ: {sold_status}\n"
+        f"📢 ᴜɴꜱᴏʟᴅ ᴄʜᴀɴɴᴇʟ: {unsold_status}\n"
+        f"🕒 ʀᴇᴘᴏʀᴛ ꜱᴄʜᴇᴅᴜʟᴇʀ: {queue_status}\n"
+        f"🗄 ᴅᴀᴛᴀʙᴀꜱᴇ: {db_status}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ ꜱᴛᴀᴛᴜꜱ: ᴛᴇꜱᴛ ᴄᴏᴍᴘʟᴇᴛᴇ ✓\n"
+        "⏱️ ᴛʜɪꜱ ᴛᴇꜱᴛ ᴍᴇꜱꜱᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ 5 ᴍɪɴᴜᴛᴇꜱ."
     )
     try:
         sent_message = await context.bot.send_message(chat_id=broadcast_id, text=test_report)
@@ -912,7 +986,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
-    init_database()
     schedule_all_daily_reports(application)
     try:
         await application.bot.set_my_description(description=BOT_DESCRIPTION)
@@ -942,16 +1015,96 @@ async def post_init(application: Application) -> None:
     logger.info("%s started", BOT_NAME)
 
 
+_HEALTH_SERVER: ThreadingHTTPServer | None = None
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP health endpoint for hosts that require a bound $PORT."""
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API name
+        path = urlsplit(self.path).path
+        if path not in ("/", "/health", "/healthz"):
+            body = b"Not found\n"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+        else:
+            body = json.dumps({"status": "ok", "service": BOT_NAME}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API name
+        path = urlsplit(self.path).path
+        self.send_response(200 if path in ("/", "/health", "/healthz") else 404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        # Avoid verbose request spam in production logs.
+        logger.debug("health %s - %s", self.address_string(), fmt % args)
+
+
+def start_health_server() -> None:
+    """Bind the host-provided port without blocking Telegram polling."""
+    global _HEALTH_SERVER
+    raw_port = os.getenv("PORT", "").strip()
+    if not raw_port:
+        logger.info("PORT is not set; skipping optional HTTP health server.")
+        return
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise RuntimeError("PORT must be a numeric TCP port supplied by your host.") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("PORT must be between 1 and 65535.")
+
+    try:
+        _HEALTH_SERVER = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+        _HEALTH_SERVER.daemon_threads = True
+        thread = threading.Thread(
+            target=_HEALTH_SERVER.serve_forever,
+            name="health-http-server",
+            daemon=True,
+        )
+        thread.start()
+        logger.info("Health endpoint listening on 0.0.0.0:%s", port)
+    except OSError:
+        logger.exception("Could not bind the host-provided PORT=%s", port)
+        raise
+
+
 def main() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         raise RuntimeError(
-            "Set BOT_TOKEN in kiyotaka_sales_tracker_v4.py, or define the BOT_TOKEN environment variable."
+            "BOT_TOKEN is missing. Set it as an environment variable in your host dashboard."
         )
-    if OWNER_ID == 123456789:
-        logger.warning("OWNER_ID is still the example value. Set it to your own Telegram numeric user ID.")
+    if OWNER_ID <= 0:
+        raise RuntimeError(
+            "OWNER_ID is missing. Set it to your numeric Telegram user ID in host environment variables."
+        )
 
     init_database()
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    start_health_server()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .connect_timeout(15.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(10.0)
+        .get_updates_connect_timeout(15.0)
+        .get_updates_read_timeout(40.0)
+        .get_updates_write_timeout(30.0)
+        .get_updates_pool_timeout(10.0)
+        .build()
+    )
 
     # Commands
     application.add_handler(CommandHandler("start", start))
@@ -977,7 +1130,15 @@ def main() -> None:
 
     application.add_error_handler(error_handler)
     logger.info("Starting polling…")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Retry transient startup/network failures indefinitely. Keep exactly one
+    # running instance for this token to avoid Telegram getUpdates conflicts.
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=-1,
+        poll_interval=1.0,
+        timeout=20,
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == "__main__":
