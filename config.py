@@ -4,7 +4,7 @@ Edit BOT_TOKEN and OWNER_ID here before running, or set environment variables.
 import os
 import re
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))  # Your numeric Telegram user ID
 
 BOT_NAME = "Kiyotaka Sales Tracker V4"
